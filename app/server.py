@@ -78,11 +78,35 @@ def create_app(db_path: str | None = None) -> Flask:
                 result = migration.run_batch(conn, budget, simulate_crash=crash)
             finally:
                 conn.close()
-            flash(
-                f"本批提交 {result['executed']} 次盘槽写入"
-                + ("，搬运已全部完成" if result["done"] else f"，下一批从 op#{result['next_op']} 继续"),
-                "ok",
-            )
+            if result.get("blocked"):
+                flash(result["error"], "err")
+            else:
+                flash(
+                    f"本批提交 {result['executed']} 次盘槽写入"
+                    + ("，搬运已全部完成" if result["done"]
+                       else f"，下一批从 op#{result['next_op']} 继续"),
+                    "ok",
+                )
+        except migration.CapacityError as exc:
+            flash(str(exc), "err")
+        except Exception as exc:  # noqa: BLE001
+            flash(str(exc), "err")
+        return redirect(url_for("index"))
+
+    @app.post("/volume/limits")
+    def limits_page():
+        try:
+            limits = {}
+            for disk in (0, 1):
+                limits[disk] = _parse_int(
+                    request.form.get(f"limit{disk}"), f"盘{disk} 扇区上限",
+                    0, db.SECTORS_PER_DISK)
+            conn = get_conn()
+            try:
+                migration.apply_limit_change(conn, limits)
+            finally:
+                conn.close()
+            flash(f"已设置扇区上限：盘0={limits[0]}，盘1={limits[1]}", "ok")
         except Exception as exc:  # noqa: BLE001
             flash(str(exc), "err")
         return redirect(url_for("index"))
@@ -99,7 +123,8 @@ def create_app(db_path: str | None = None) -> Flask:
             head = r["body"].rstrip(b"\x00")[:48]
             where = "临时槽" if r["staged"] else f"盘{r['disk']} 槽{r['slot']}"
             flash(
-                f"读到 LBN {lbn}（位置：{where}），最近已提交正文前 48 字节：{head!r}",
+                f"读到 LBN {lbn}（位置：{where}，{r['sectors']} 个已存扇区），"
+                f"最近已提交正文前 48 字节：{head!r}",
                 "ok",
             )
         except Exception as exc:  # noqa: BLE001
@@ -115,7 +140,10 @@ def create_app(db_path: str | None = None) -> Flask:
                 r = migration.write_lbn(conn, lbn, _normalize_body(request.form.get("body", "")))
             finally:
                 conn.close()
-            flash(f"LBN {lbn} 改写已提交（写入 {r['target']}）", "ok")
+            flash(
+                f"LBN {lbn} 改写已提交（写入 {r['target']}，占 {r['sectors']} 扇区）",
+                "ok",
+            )
         except Exception as exc:  # noqa: BLE001
             flash(str(exc), "err")
         return redirect(url_for("index"))
@@ -219,6 +247,38 @@ def create_app(db_path: str | None = None) -> Flask:
             return jsonify(migration.verify(conn))
         finally:
             conn.close()
+
+    @app.get("/api/usage")
+    def api_usage():
+        conn = get_conn()
+        try:
+            return jsonify(migration.usage_report(conn))
+        finally:
+            conn.close()
+
+    @app.post("/api/limits")
+    def api_limits():
+        data = request.get_json(silent=True) or {}
+        try:
+            limits = {}
+            for disk in (0, 1):
+                key = f"limit{disk}"
+                if key in data:
+                    value = data[key]
+                    if not isinstance(value, int):
+                        raise ValueError(f"{key} must be an integer")
+                    limits[disk] = value
+            if not limits:
+                raise ValueError("provide limit0 and/or limit1")
+            conn = get_conn()
+            try:
+                migration.apply_limit_change(conn, limits)
+                report = migration.usage_report(conn)
+            finally:
+                conn.close()
+            return jsonify(ok=True, usage=report)
+        except Exception as exc:  # noqa: BLE001
+            return jsonify(ok=False, error=str(exc)), 400
 
     return app
 

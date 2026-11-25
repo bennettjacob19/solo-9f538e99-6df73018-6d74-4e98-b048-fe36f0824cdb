@@ -31,6 +31,7 @@
   .pill.run { background: #fff8c5; color: var(--warn); }
   .pill.done { background: #dafbe1; color: var(--ok); }
   .pill.idle { background: #eaeef2; color: #57606a; }
+  .pill.err { background: #ffebe9; color: var(--err); }
   .disk { display: grid; grid-template-columns: repeat(8, 1fr); gap: 4px; }
   .slot { border: 1px solid var(--bd); border-radius: 4px; padding: 4px 2px; font-size: 11px;
           text-align: center; background: #fff; min-height: 42px; }
@@ -51,7 +52,7 @@
 </head>
 <body>
 <h1>虚拟卷在线换条带模拟台</h1>
-<div class="sub">两块盘 × 每盘 16 槽 × 4 KiB 块；初始单块交替落盘。搬运用单临时槽（最多暂存一块），逐批提交，崩溃后按已提交状态恢复。</div>
+<div class="sub">两块盘 × 每盘 16 槽 × 4 KiB 块；每块按 512 字节扇区稀疏存放（全零扇区不占正文），每盘扇区上限由值班员设置，临时槽单独计容（最多暂存一块）。搬运用单临时槽，逐批提交，崩溃后按已提交状态恢复。</div>
 
 {% with messages = get_flashed_messages(with_categories=true) %}
   {% for category, message in messages %}
@@ -68,6 +69,7 @@
       <div>
         {% if not mig %}<span class="pill idle">未开始（条带宽度 1）</span>
         {% elif mig.status == 'running' %}<span class="pill run">搬运中（目标条带宽度 {{ state.stripe_k }}）</span>
+        {% elif mig.status == 'blocked' %}<span class="pill err">容量不足，待腾空间</span>
         {% else %}<span class="pill done">已完成（条带宽度 {{ state.stripe_k }}）</span>{% endif %}
       </div>
       <b>进度</b>
@@ -76,11 +78,40 @@
       <div>{% if mig %}{{ mig.last_writes }} 次{% else %}—{% endif %}</div>
       <b>临时槽</b>
       <div>{% if state.staging %}暂存 LBN {{ state.staging | map(attribute='lbn') | join(', ') }}（最多 1 块）{% else %}空{% endif %}</div>
+      <b>容量提示</b>
+      <div>{% if mig and mig.status == 'blocked' %}<span style="color:var(--err)">{{ mig.error }}</span>{% else %}—{% endif %}</div>
       <b>校验</b>
       <div>{% if state.verification.ok %}<span style="color:var(--ok)">通过</span>
         {% else %}<span style="color:var(--err)">{{ state.verification.errors | join('；') }}</span>{% endif %}</div>
     </div>
     <p class="note">“本批写入次数”在每批提交后刷新；若在提交前崩溃，重启后该值回退为上一已提交批的计数。</p>
+  </div>
+
+  <div class="card">
+    <h2 style="margin-top:0">容量与扇区上限</h2>
+    <table>
+      <thead><tr><th>位置</th><th>已用扇区</th><th>上限</th><th>剩余</th></tr></thead>
+      <tbody>
+        {% for d in (0, 1) %}
+        {% set u = state.usage.disks[d] %}
+        <tr {% if u.free < 0 %}class="staged-row"{% endif %}>
+          <td>盘 {{ d }}</td><td>{{ u.used }}</td><td>{{ u.limit }}</td><td>{{ u.free }}</td>
+        </tr>
+        {% endfor %}
+        {% set st = state.usage.staging %}
+        <tr class="staged-row">
+          <td>临时槽</td><td>{{ st.used }}</td><td>{{ st.limit }}</td><td>{{ st.free }}</td>
+        </tr>
+      </tbody>
+    </table>
+    <form method="post" action="{{ url_for('limits_page') }}">
+      <label>盘0 上限 <input type="number" name="limit0" min="0" max="128"
+            value="{{ state.usage.disks[0].limit }}" required></label>
+      <label>盘1 上限 <input type="number" name="limit1" min="0" max="128"
+            value="{{ state.usage.disks[1].limit }}" required></label>
+      <button type="submit">设置扇区上限</button>
+    </form>
+    <p class="note">上限低于当前占用时拒绝；改写使某盘超额时拒绝该次改写。临时槽容量单算，固定 8 扇区。腾出空间后可继续搬运。</p>
   </div>
 
   <div class="card">
@@ -149,10 +180,10 @@
 </div>
 <p class="note">⚠ 表示该槽位上的块正暂存于临时槽（同一时刻最多一块）；空槽是环搬运过程中的“洞”，属于正常中间态。</p>
 
-<h2>逻辑块明细（当前盘位 / 本批写入次数）</h2>
+<h2>逻辑块明细（当前盘位 / 扇区占用 / 本批写入次数）</h2>
 <table>
   <thead><tr>
-    <th>LBN</th><th>当前盘</th><th>当前槽</th><th>位置状态</th>
+    <th>LBN</th><th>当前盘</th><th>当前槽</th><th>位置状态</th><th>已存扇区</th>
     <th>目标盘（k={{ state.stripe_k }}）</th><th>目标槽</th><th>是否到位</th><th>最近一批写入次数</th>
   </tr></thead>
   <tbody>
@@ -162,6 +193,7 @@
       <td>{% if b.staged %}—（临时槽）{% else %}{{ b.disk }}{% endif %}</td>
       <td>{% if b.staged %}—{% else %}{{ b.slot }}{% endif %}</td>
       <td>{% if b.staged %}临时槽暂存中{% else %}盘上{% endif %}</td>
+      <td>{{ b.sectors }}</td>
       <td>{{ b.expected_disk }}</td>
       <td>{{ b.expected_slot }}</td>
       <td>{% if b.at_target %}✓{% else %}<span style="color:var(--warn)">待搬</span>{% endif %}</td>
@@ -170,6 +202,23 @@
   {% endfor %}
   </tbody>
 </table>
+
+<h2>环（条带置换环）进度</h2>
+<table>
+  <thead><tr><th>环</th><th>位置数</th><th>起点偏移</th><th>已完成步 / 总步</th><th>状态</th></tr></thead>
+  <tbody>
+  {% for r in state.rings %}
+    <tr>
+      <td>#{{ r.ring_id }}</td>
+      <td>{{ r.positions | length }}</td>
+      <td>{% if r.start is none %}—{% else %}{{ r.start }}{% endif %}</td>
+      <td>{{ r.step }} / {{ r.total_steps }}</td>
+      <td>{% if r.done %}完成{% elif r.start is none %}待开始{% else %}进行中{% endif %}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+<p class="note">每个环选择一个“全程不超两盘上限”的暂存起点；若没有可行起点或已开始的环下一步会超额，本批只提交能做的步骤并提示缺空间的盘。</p>
 
 <h2>事件日志（最近 25 条）</h2>
 <div class="log">
